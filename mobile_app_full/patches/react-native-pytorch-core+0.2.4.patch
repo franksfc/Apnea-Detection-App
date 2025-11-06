@@ -1,0 +1,13 @@
+diff --git a/node_modules/react-native-pytorch-core/android/build.gradle b/node_modules/react-native-pytorch-core/android/build.gradle
+index c70681a..4d9f6ed 100644
+--- a/node_modules/react-native-pytorch-core/android/build.gradle
++++ b/node_modules/react-native-pytorch-core/android/build.gradle
+@@ -101,7 +101,7 @@ repositories {
+         url("$rootDir/../node_modules/react-native/android")
+     }
+     google()
+-    jcenter()
++    mavenCentral()
+ }
+ 
+ dependencies {
