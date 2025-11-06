@@ -17,12 +17,13 @@ import os
 import sys
 import argparse
 import time
+import json
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from typing import Tuple
+from typing import Tuple, Optional
 
 # 音频捕获库
 HAS_SOUNDDEVICE = False
@@ -230,12 +231,16 @@ def bandpass_filter(sig: np.ndarray, lowcut: float, highcut: float, fs: int, ord
 def preprocess_waveform(
     wav: np.ndarray,
     fs: int = 16000,
-    do_denoise: bool = True,
-    do_bandpass: bool = True,
+    do_denoise: bool = False,  # 默认关闭，与训练时一致
+    do_bandpass: bool = False,  # 默认关闭，与训练时一致
     lowcut: float = 100.0,
     highcut: float = 2000.0
 ) -> np.ndarray:
-    """预处理音频波形：降噪（可选）+ 带通滤波 + 归一化"""
+    """预处理音频波形：降噪（可选）+ 带通滤波 + 归一化
+    
+    注意：默认不启用降噪和滤波，与训练时保持一致。
+    如果训练时启用了这些选项，预测时也应该启用。
+    """
     # 降噪
     if do_denoise and HAS_NR:
         wav = nr.reduce_noise(y=wav, sr=fs, stationary=False, prop_decrease=0.9)
@@ -244,7 +249,7 @@ def preprocess_waveform(
     if do_bandpass:
         wav = bandpass_filter(wav, lowcut=lowcut, highcut=highcut, fs=fs, order=4)
     
-    # 归一化
+    # Z-score归一化（与训练时一致）
     wav = wav - np.mean(wav)
     std = np.std(wav) + 1e-8
     wav = wav / std
@@ -261,31 +266,49 @@ def audio_to_melspectrogram(
     fmin: int = 50,
     fmax: int = 4000
 ) -> torch.Tensor:
-    """将音频转换为Mel频谱图"""
+    """将音频转换为Mel频谱图（与训练时完全一致）"""
     # 转换为torch tensor
     wav_t = torch.tensor(wav, dtype=torch.float32).unsqueeze(0)  # (1, L)
     
-    # Mel频谱图转换
+    # Mel频谱图转换（确保参数与训练时完全一致）
+    # 注意：torchaudio的MelSpectrogram默认center=True，这会在两端填充n_fft//2
     mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=sr,
         n_fft=n_fft,
         hop_length=hop_length,
         n_mels=n_mels,
         f_min=fmin,
-        f_max=fmax
+        f_max=fmax,
+        center=True,  # 显式指定，与训练时一致（默认值）
+        pad_mode='reflect'  # 显式指定填充模式
     )
     to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
     
     mel = mel_transform(wav_t)  # (1, n_mels, T)
     mel_db = to_db(mel)
     
-    # 归一化：使用min-max归一化到[-1, 1]（与训练时一致）
-    mel_min = mel_db.min()
-    mel_max = mel_db.max()
+    # 调试信息：打印dB转换后的原始值（归一化前）
+    print(f"[调试] Mel频谱图dB值（归一化前）: min={mel_db.min().item():.4f}, max={mel_db.max().item():.4f}, mean={mel_db.mean().item():.4f}")
+    
+    # 归一化：使用min-max归一化到[-1, 1]（与训练时完全一致）
+    # 训练时的归一化方式：对每个样本计算min和max，然后归一化
+    # 训练时mel_db形状是(B, n_mels, T)，然后unsqueeze成(B, 1, n_mels, T)
+    # 归一化时：min(dim=3, keepdim=True)[0].min(dim=2, keepdim=True)[0]
+    # 这里mel_db是(1, n_mels, T)，需要先unsqueeze成(1, 1, n_mels, T)再归一化
+    mel_db = mel_db.unsqueeze(0)  # (1, 1, n_mels, T)
+    
+    # 按照训练时的方式归一化
+    mel_min = mel_db.min(dim=3, keepdim=True)[0].min(dim=2, keepdim=True)[0]  # (1, 1, 1, 1)
+    mel_max = mel_db.max(dim=3, keepdim=True)[0].max(dim=2, keepdim=True)[0]  # (1, 1, 1, 1)
     mel_range = (mel_max - mel_min) + 1e-8
     mel_db = 2.0 * (mel_db - mel_min) / mel_range - 1.0
     
-    return mel_db.unsqueeze(0)  # (1, 1, n_mels, T)
+    # 调试信息：打印Mel频谱图形状
+    print(f"[调试] Mel频谱图形状: {mel_db.shape}, 时间步数: {mel_db.shape[-1]}")
+    print(f"[调试] Mel频谱图范围: min={mel_db.min().item():.4f}, max={mel_db.max().item():.4f}")
+    print(f"[调试] Mel频谱图统计: mean={mel_db.mean().item():.4f}, std={mel_db.std().item():.4f}")
+    
+    return mel_db  # (1, 1, n_mels, T)
 
 
 # ==================== 音频捕获和推理 ====================
@@ -333,16 +356,51 @@ def record_audio_pyaudio(duration: float = 10.0, sr: int = 16000, chunk: int = 1
     return audio
 
 
+def load_optimal_threshold(model_path: str, default_threshold: float = 0.34) -> float:
+    """
+    从test_metrics.json加载最佳阈值，如果没有则使用默认值
+    
+    参数:
+        model_path: 模型文件路径
+        default_threshold: 默认阈值（从训练结果看，最佳阈值约为0.34）
+    
+    返回:
+        optimal_threshold: 最佳阈值
+    """
+    # 尝试从同目录下的test_metrics.json读取
+    model_dir = os.path.dirname(model_path)
+    metrics_path = os.path.join(model_dir, "test_metrics.json")
+    
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, 'r', encoding='utf-8') as f:
+                metrics = json.load(f)
+                if 'optimal_threshold' in metrics:
+                    threshold = metrics['optimal_threshold']
+                    print(f"[信息] 从 {metrics_path} 加载最佳阈值: {threshold:.3f}")
+                    return float(threshold)
+        except Exception as e:
+            print(f"[警告] 读取阈值文件失败: {e}，使用默认阈值 {default_threshold:.3f}")
+    
+    print(f"[信息] 使用默认阈值: {default_threshold:.3f} (训练时最佳阈值约为0.34)")
+    return default_threshold
+
+
 def predict_apnea(
     model: nn.Module,
     audio: np.ndarray,
     device: torch.device,
     sr: int = 16000,
-    do_denoise: bool = True,
-    do_bandpass: bool = True
+    do_denoise: bool = False,  # 默认关闭，与训练时一致
+    do_bandpass: bool = False,  # 默认关闭，与训练时一致
+    threshold: float = 0.34  # 分类阈值（训练时最佳阈值约为0.34）
 ) -> Tuple[int, float, float]:
     """
     对音频进行呼吸暂停预测
+    
+    参数:
+        threshold: 分类阈值，呼吸暂停概率 >= threshold 时预测为呼吸暂停
+                  训练时最佳阈值约为0.34（而非默认0.5）
     
     返回:
         pred: 预测类别 (0=正常, 1=呼吸暂停)
@@ -374,11 +432,39 @@ def predict_apnea(
     
     # 推理
     with torch.no_grad():
+        # 检查输入形状
+        print(f"[调试] 模型输入形状: {mel_spec.shape}")
+        expected_shape = (1, 1, 64, 313)  # 基于center=True的计算
+        if mel_spec.shape != expected_shape:
+            print(f"[警告] 输入形状不匹配！期望: {expected_shape}, 实际: {mel_spec.shape}")
+            # 尝试调整形状
+            if mel_spec.shape[-1] < expected_shape[-1]:
+                # 时间步数不足，用零填充
+                pad_size = expected_shape[-1] - mel_spec.shape[-1]
+                mel_spec = F.pad(mel_spec, (0, pad_size), mode='constant', value=0)
+                print(f"[调整] 已填充到期望形状: {mel_spec.shape}")
+            elif mel_spec.shape[-1] > expected_shape[-1]:
+                # 时间步数过多，截断
+                mel_spec = mel_spec[..., :expected_shape[-1]]
+                print(f"[调整] 已截断到期望形状: {mel_spec.shape}")
+        
         logits = model(mel_spec)
+        
+        # 调试信息：打印logits
+        print(f"[调试] Logits: 正常={logits[0, 0].item():.4f}, 呼吸暂停={logits[0, 1].item():.4f}")
+        
         probs = F.softmax(logits, dim=1)
-        pred = probs.argmax(dim=1).item()
         prob_normal = probs[0, 0].item()
         prob_apnea = probs[0, 1].item()
+        
+        # 使用阈值进行预测（与训练时一致）
+        # 训练时最佳阈值约为0.34，而不是默认的0.5
+        pred = 1 if prob_apnea >= threshold else 0
+        
+        # 调试信息：打印概率和阈值
+        print(f"[调试] 概率: 正常={prob_normal*100:.2f}%, 呼吸暂停={prob_apnea*100:.2f}%")
+        print(f"[调试] 使用阈值: {threshold:.3f} (训练时最佳阈值)")
+        print(f"[调试] 预测类别: {'呼吸暂停' if pred == 1 else '正常'}")
     
     return pred, prob_apnea, prob_normal
 
@@ -402,10 +488,11 @@ def continuous_monitoring(
     device: torch.device,
     duration: float = 10.0,
     sr: int = 16000,
-    do_denoise: bool = True,
-    do_bandpass: bool = True,
+    do_denoise: bool = False,  # 默认关闭，与训练时一致
+    do_bandpass: bool = False,  # 默认关闭，与训练时一致
     audio_device: int = None,
-    continuous: bool = True
+    continuous: bool = True,
+    threshold: float = 0.34  # 分类阈值（训练时最佳阈值）
 ):
     """持续监控模式"""
     # 检查音频库是否可用
@@ -420,6 +507,9 @@ def continuous_monitoring(
     print(f"录音时长: {duration} 秒")
     print(f"采样率: {sr} Hz")
     print(f"设备: {'GPU (CUDA)' if device.type == 'cuda' else 'CPU'}")
+    print(f"降噪: {'启用' if do_denoise else '禁用 (默认，与训练时一致)'}")
+    print(f"带通滤波: {'启用' if do_bandpass else '禁用 (默认，与训练时一致)'}")
+    print(f"分类阈值: {threshold:.3f} (训练时最佳阈值，而非默认0.5)")
     print("=" * 60)
     print("\n提示: 按 Ctrl+C 停止监控")
     
@@ -452,7 +542,7 @@ def continuous_monitoring(
             print(f"\n[分析中] 第 {iteration} 次检测...")
             
             pred, prob_apnea, prob_normal = predict_apnea(
-                model, audio, device, sr, do_denoise, do_bandpass
+                model, audio, device, sr, do_denoise, do_bandpass, threshold=threshold
             )
             
             # 显示结果
@@ -482,16 +572,18 @@ def main():
                         help="每次录音时长（秒），建议10秒")
     parser.add_argument("--sr", type=int, default=16000,
                         help="采样率（Hz）")
-    parser.add_argument("--no_denoise", action="store_true",
-                        help="禁用降噪")
-    parser.add_argument("--no_bandpass", action="store_true",
-                        help="禁用带通滤波")
+    parser.add_argument("--denoise", action="store_true",
+                        help="启用降噪（默认关闭，与训练时一致）")
+    parser.add_argument("--bandpass", action="store_true",
+                        help="启用带通滤波（默认关闭，与训练时一致）")
     parser.add_argument("--single", action="store_true",
                         help="单次检测模式（需要手动触发）")
     parser.add_argument("--audio_device", type=int, default=None,
                         help="音频设备ID（用于sounddevice）")
     parser.add_argument("--list_devices", action="store_true",
                         help="列出可用的音频设备")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="分类阈值（默认从test_metrics.json读取，或使用0.34）")
     
     args = parser.parse_args()
     
@@ -530,15 +622,38 @@ def main():
     except TypeError:
         # Fallback for older PyTorch versions that don't have weights_only parameter
         checkpoint = torch.load(args.model_path, map_location=device)
+    
     if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
         model.load_state_dict(checkpoint['model_state'])
         print(f"[信息] 加载检查点，epoch: {checkpoint.get('epoch', 'unknown')}")
+        if 'val_f1' in checkpoint:
+            print(f"[信息] 验证集F1分数: {checkpoint['val_f1']:.4f}")
+        if 'val_acc' in checkpoint:
+            print(f"[信息] 验证集准确率: {checkpoint['val_acc']:.4f}")
     else:
         # 直接加载state_dict
         model.load_state_dict(checkpoint)
+        print("[信息] 直接加载state_dict")
     
     model.eval()
+    
+    # 测试模型输出（使用随机输入）
+    print("[测试] 测试模型前向传播...")
+    with torch.no_grad():
+        test_input = torch.randn(1, 1, 64, 313, device=device)
+        test_output = model(test_input)
+        print(f"[测试] 测试输入形状: {test_input.shape}")
+        print(f"[测试] 测试输出形状: {test_output.shape}")
+        print(f"[测试] 测试输出logits: {test_output[0].cpu().numpy()}")
+    
     print("[完成] 模型加载成功")
+    
+    # 加载最佳阈值
+    if args.threshold is not None:
+        threshold = args.threshold
+        print(f"[信息] 使用命令行指定的阈值: {threshold:.3f}")
+    else:
+        threshold = load_optimal_threshold(args.model_path)
     
     # 运行监控
     continuous_monitoring(
@@ -546,10 +661,11 @@ def main():
         device,
         duration=args.duration,
         sr=args.sr,
-        do_denoise=(not args.no_denoise),
-        do_bandpass=(not args.no_bandpass),
+        do_denoise=args.denoise,
+        do_bandpass=args.bandpass,
         audio_device=args.audio_device,
-        continuous=(not args.single)
+        continuous=(not args.single),
+        threshold=threshold
     )
 
 

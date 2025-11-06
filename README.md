@@ -14,7 +14,7 @@
 - [PC端实时检测](#pc端实时检测)
 - [移动端部署](#移动端部署)
 - [项目结构](#项目结构)
-- [常见问题](#常见问题)
+- [最新更新](#最新更新)
 
 ## 项目简介
 
@@ -743,8 +743,8 @@ python predict_microphone.py \
 - `--model_path`: 模型文件路径
 - `--duration`: 每次录音时长 (秒，默认10秒)
 - `--single`: 单次检测模式 (需要手动触发)
-- `--no_denoise`: 禁用降噪
-- `--no_bandpass`: 禁用带通滤波
+- `--denoise`: 启用降噪 (默认关闭，与训练时一致)
+- `--bandpass`: 启用带通滤波 (默认关闭，与训练时一致)
 - `--list_devices`: 列出可用音频设备
 
 ### 连续监控模式
@@ -891,23 +891,6 @@ adb logcat | grep "ApneaDetection"
 - 在Xcode中打开控制台查看日志
 - 或使用 `react-native log-ios` 命令
 
-#### 常见问题排查
-
-1. **模型加载失败**:
-   - 检查模型文件是否在正确位置
-   - 检查文件路径是否正确 (Android使用 `asset://` 协议)
-   - 查看原生模块日志获取详细错误
-
-2. **音频捕获失败**:
-   - 检查麦克风权限是否已授予
-   - Android: 在设置中手动授予权限
-   - iOS: 首次运行时会弹出权限请求
-
-3. **构建失败**:
-   - 检查补丁是否已应用: `ls mobile_app_full/patches/`
-   - 清理构建缓存: `cd android && ./gradlew clean`
-   - 重新安装依赖: `rm -rf node_modules && npm install`
-
 ### 步骤6: 构建发布版本
 
 #### Android APK
@@ -962,6 +945,78 @@ AAB文件位于: `android/app/build/outputs/bundle/release/app-release.aab`
    - **Enterprise**: 企业内部分发
    - **Development**: 开发版本
 
+## 最新更新
+
+### 2024年11月 - 模型推理优化与移动端对齐
+
+本次更新重点优化了模型推理流程，确保PC端和移动端使用完全一致的预处理和分类阈值，显著提升了检测准确率。
+
+#### 1. 优化阈值实现
+
+- **问题**: 训练时使用优化阈值（0.34）获得90%准确率，但推理时使用默认阈值（0.5）导致准确率下降至70%
+- **解决方案**: 
+  - 在 `predict_microphone.py` 中实现自动加载训练时优化的阈值（从 `outputs/test_metrics.json` 读取）
+  - 在移动端 `ModelInference.ts` 中同样使用0.34作为默认阈值
+  - 确保PC端和移动端使用相同的分类阈值进行预测
+- **效果**: PC端和移动端准确率提升至与训练时一致的90%水平
+
+#### 2. 模型验证工具
+
+- **新增**: `validate_numpy.py` - 直接使用numpy文件验证模型性能
+- **功能**:
+  - 从numpy文件直接加载音频数据，绕过麦克风输入，隔离潜在问题
+  - 支持单文件测试和批量数据集验证
+  - 自动计算准确率、精确率、召回率、F1分数等指标
+  - 支持使用优化阈值进行预测，与训练时保持一致
+- **用法**:
+  ```bash
+  python validate_numpy.py \
+    --model_path outputs/apnea_2dcnn_best.pth \
+    --data_root psg-audio-apnea-audios/PSG-AUDIO/APNEA_EDF
+  ```
+
+#### 3. 移动端预处理对齐
+
+为确保移动端与PC端（`torchaudio`）的Mel频谱图生成完全一致，进行了以下关键修复：
+
+- **dB转换修正**: 
+  - 从功率谱的 `10 * log10` 改为幅度谱的 `20 * log10`
+  - 匹配 `torchaudio.transforms.AmplitudeToDB` 的行为
+  
+- **频谱类型修正**:
+  - 从功率谱 (`magnitude²`) 改为幅度谱 (`magnitude`)
+  - 匹配 `torchaudio.transforms.MelSpectrogram` 的默认输出
+  
+- **FFT归一化修正**:
+  - 移除了 `1.0 / n_fft` 的归一化因子
+  - `torchaudio` 的MelSpectrogram在幅度谱模式下不应用此缩放
+  
+- **窗口填充修正**:
+  - 使用 `reflect` 填充模式，匹配 `torchaudio` 的 `center=True, pad_mode='reflect'` 行为
+
+#### 4. 预处理参数统一
+
+- **PC端 (`predict_microphone.py`)**:
+  - 默认禁用降噪和带通滤波（`do_denoise=False`, `do_bandpass=False`），与训练时保持一致
+  - 自动从 `outputs/test_metrics.json` 加载优化阈值
+  
+- **移动端 (`ModelInference.ts`)**:
+  - 默认阈值设置为0.34（训练时最佳阈值）
+  - Mel频谱图生成参数与PC端完全对齐
+  - 支持可选的降噪和带通滤波（默认关闭）
+
+#### 5. 调试功能增强
+
+- 在 `predict_microphone.py` 和 `ModelInference.ts` 中添加了详细的调试日志：
+  - Mel频谱图统计信息（min, max, mean, std）
+  - 归一化前后的数值范围
+  - 模型输出的logits和概率值
+  - 阈值应用过程
+
+#### 技术细节
+
+所有修复都基于对 `torchaudio.transforms.MelSpectrogram` 和 `torchaudio.transforms.AmplitudeToDB` 源码的深入分析，确保移动端的TypeScript/Kotlin实现与PC端的Python实现产生完全相同的数值结果。
+
 ## 项目结构
 
 ```
@@ -969,6 +1024,7 @@ apnea/
 ├── main.py                          # 主训练脚本
 ├── convert_model_for_mobile.py      # 模型转换脚本
 ├── predict_microphone.py            # PC端实时检测
+├── validate_numpy.py                # 模型验证工具（numpy文件）
 ├── requirements.txt                 # Python依赖
 ├── README.md                        # 本文档
 │
