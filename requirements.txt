@@ -1,0 +1,28 @@
+# 睡眠呼吸暂停识别系统依赖
+# Python >= 3.7
+
+# 深度学习框架
+torch>=1.9.0
+torchaudio>=0.9.0
+
+# 数据处理
+numpy>=1.19.0
+scipy>=1.5.0
+
+# 音频处理
+sounddevice>=0.4.0  # 推荐，跨平台音频捕获
+# pyaudio>=0.2.11    # 备选，Windows上可能需要额外配置
+
+# 可选：音频降噪（提高识别准确率）
+noisereduce>=2.0.0
+
+# 机器学习工具
+scikit-learn>=0.24.0
+
+# 可视化（训练时使用）
+matplotlib>=3.3.0
+tqdm>=4.60.0
+
+# 其他
+tensorboard>=2.5.0  # 可选，用于训练可视化
+

@@ -1,0 +1,26 @@
+{
+  "accuracy": 0.8853882169332813,
+  "precision": 0.8837209302325582,
+  "recall": 0.9397401784316795,
+  "f1": 0.9108700599256618,
+  "auc": 0.9534422980670691,
+  "confusion_matrix": [
+    [
+      3073,
+      790
+    ],
+    [
+      385,
+      6004
+    ]
+  ],
+  "classification_report": "              precision    recall  f1-score   support\n\n   normal(0)       0.89      0.80      0.84      3863\n    apnea(1)       0.88      0.94      0.91      6389\n\n    accuracy                           0.89     10252\n   macro avg       0.89      0.87      0.88     10252\nweighted avg       0.89      0.89      0.88     10252\n",
+  "optimal_threshold": 0.34,
+  "metrics_at_optimal_threshold": {
+    "threshold": 0.34,
+    "accuracy": 0.8853882169332813,
+    "precision": 0.8837209302325582,
+    "recall": 0.9397401784316795,
+    "f1": 0.9108700599256618
+  }
+}
